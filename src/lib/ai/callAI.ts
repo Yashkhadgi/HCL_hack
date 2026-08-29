@@ -1,39 +1,64 @@
 import { z } from 'zod';
+import { callGemini, getGeminiEmbedding } from './gemini';
+import { callGroq } from './groq';
 
 /**
  * The single unified AI abstraction layer for the Adaptive Learning Intelligence Engine.
+ * Implements fallback and retry logic per Master Plan §6.4 & §6.5.
  * 
- * @param role 'understanding' (Gemini) or 'writing' (Groq)
- * @param prompt The system/user prompt combined
- * @param schema The Zod schema that the LLM response must strictly adhere to
- * @returns A parsed object matching the Zod schema
+ * @param role 'understanding' (Gemini primary), 'writing' (Groq primary), or 'embedding' (Gemini text-embedding-004)
+ * @param prompt The system/user prompt combined, or target text for embedding
+ * @param schema The Zod schema that the LLM response must strictly adhere to (optional for embedding)
+ * @returns A parsed object matching the Zod schema, or a number[] vector for embedding
  */
 export async function callAI<T>(
-  role: 'understanding' | 'writing',
+  role: 'understanding' | 'writing' | 'embedding',
   prompt: string,
-  schema: z.ZodType<T>
-): Promise<T> {
-  // STUB IMPLEMENTATION
-  // This is a placeholder so Rudrakshi and Sameera can build against this signature immediately.
-  // It logs the request and returns a "fake" successful parse of empty/default data.
-  // TODO: Implement actual Gemini 2.5 Flash and Groq Llama 3.3 70B provider wiring,
-  // circuit breakers, failover, and structured output parsing.
+  schema?: z.ZodType<T>
+): Promise<{ data: T; provider: 'gemini' | 'groq' | 'mock' } | number[]> {
+  if (role === 'embedding') {
+    try {
+      console.log(`[callAI] Attempting Gemini embedding for text: ${prompt.substring(0, 60)}...`);
+      return await getGeminiEmbedding(prompt);
+    } catch (error: unknown) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      console.error(`[callAI] Gemini embedding failed:`, errMsg);
+      throw error;
+    }
+  }
 
-  console.log(`[callAI Stub] Role: ${role}`);
-  console.log(`[callAI Stub] Prompt snippet: ${prompt.substring(0, 100)}...`);
+  if (!schema) {
+    throw new Error('Schema is required for understanding or writing roles');
+  }
 
-  // To prevent downstream code from crashing, we attempt to generate a "safe" empty object
-  // that satisfies the schema, or throw an error if we can't stub it easily.
-  // In a real hackathon scenario, you might just throw an error here to force real wiring,
-  // but for unblocking, returning any dummy data is better.
-  
+  const primaryProvider = role === 'understanding' ? callGemini : callGroq;
+  const fallbackProvider = role === 'understanding' ? callGroq : callGemini;
+  const primaryName = role === 'understanding' ? 'gemini' : 'groq';
+  const fallbackName = role === 'understanding' ? 'groq' : 'gemini';
+
   try {
-    // We try to parse an empty object. If the schema has defaults or is deeply optional, this works.
-    // Otherwise, it throws. This is just for the stub!
-    return schema.parse({});
-  } catch (e) {
-    console.warn("[callAI Stub] Could not automatically stub the Zod schema. Returning casted empty object.");
-    // Force cast to T to keep TypeScript happy.
-    return {} as T;
+    console.log(`[callAI] Attempting ${primaryName} for role: ${role}`);
+    const data = await primaryProvider(prompt, schema);
+    return { data, provider: primaryName };
+  } catch (error: unknown) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.warn(`[callAI] ${primaryName} failed:`, errMsg);
+    console.warn(`[callAI] Falling back to ${fallbackName}...`);
+
+    try {
+      const data = await fallbackProvider(prompt, schema);
+      return { data, provider: fallbackName };
+    } catch (fallbackError: unknown) {
+      const fallbackErrMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+      console.error(`[callAI] ${fallbackName} also failed:`, fallbackErrMsg);
+      
+      console.error('[callAI] ALL PROVIDERS DOWN. Returning emergency template fallback.');
+      try {
+        const data = schema.parse({});
+        return { data, provider: 'mock' };
+      } catch {
+        throw new Error('All AI providers failed and emergency template could not satisfy the strict schema.');
+      }
+    }
   }
 }
